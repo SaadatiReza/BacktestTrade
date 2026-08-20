@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.data_provider import DataProviderError, fetch_and_cache, load_candles
 from app.db import get_db
 from app.schemas import FetchDataRequest
+from app.timeutil import to_naive_utc
 
 router = APIRouter(prefix="/data", tags=["data"])
 
@@ -21,5 +22,7 @@ def fetch_data(req: FetchDataRequest, db: Session = Depends(get_db)):
 def get_candles(symbol: str, interval: str, start: str, end: str, db: Session = Depends(get_db)):
     from datetime import datetime
 
-    df = load_candles(db, symbol, interval, datetime.fromisoformat(start), datetime.fromisoformat(end))
+    start_dt = to_naive_utc(datetime.fromisoformat(start))
+    end_dt = to_naive_utc(datetime.fromisoformat(end))
+    df = load_candles(db, symbol, interval, start_dt, end_dt)
     return df.assign(time=df["time"].astype(str)).to_dict(orient="records") if len(df) else []

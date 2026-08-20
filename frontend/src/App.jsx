@@ -1,26 +1,35 @@
-import { useState } from "react";
-import { getCandles, runBacktest } from "./api";
+import { useEffect, useState } from "react";
+import { getCandles, getStrategies, runBacktest } from "./api";
 import Chart from "./Chart";
 
-const DEFAULT_CONFIG = {
-  spike_lookback: 3,
-  spike_atr_len: 14,
-  spike_atr_mult: 1.5,
-  min_body_ratio: 0.65,
-  use_context_filter: true,
-  context_ema_len: 50,
-  swing_fractal_width: 2,
-  min_2l_swings: 2,
-  structure_invalidation_buffer: 0,
-  entry_mode: "retest",
-  require_rejection_candle: true,
-  sl_buffer: 0,
+const DEFAULT_EXECUTION = {
   max_risk_price: null,
   tp_mode: "split",
   rr_target: 2,
   max_holding_bars: 200,
   allow_concurrent_trades: false,
 };
+
+// JSON-schema fields sometimes wrap the "real" type in anyOf (e.g. Optional[float]
+// -> anyOf: [{type: number}, {type: null}]). Flatten to the non-null branch so
+// SchemaField can read .type/.enum/.minimum directly.
+function resolveSchema(raw) {
+  if (raw.anyOf) {
+    const nonNull = raw.anyOf.find((s) => s.type && s.type !== "null");
+    if (nonNull) return { ...raw, ...nonNull };
+  }
+  return raw;
+}
+
+function defaultsFromSchema(configSchema) {
+  const props = configSchema?.properties || {};
+  const defaults = {};
+  for (const [key, raw] of Object.entries(props)) {
+    const schema = resolveSchema(raw);
+    defaults[key] = schema.default !== undefined ? schema.default : null;
+  }
+  return defaults;
+}
 
 function formatDateTime(iso) {
   if (!iso) return "—";
@@ -40,7 +49,11 @@ export default function App() {
   const [interval, setInterval_] = useState("1h");
   const [start, setStart] = useState(isoDaysAgo(60));
   const [end, setEnd] = useState(isoDaysAgo(0));
-  const [config, setConfig] = useState(DEFAULT_CONFIG);
+
+  const [strategies, setStrategies] = useState([]);
+  const [strategyId, setStrategyId] = useState("sp2l");
+  const [strategyConfig, setStrategyConfig] = useState({});
+  const [execution, setExecution] = useState(DEFAULT_EXECUTION);
 
   const [candles, setCandles] = useState([]);
   const [result, setResult] = useState(null);
@@ -49,8 +62,33 @@ export default function App() {
   const [error, setError] = useState(null);
   const [riskPerTrade, setRiskPerTrade] = useState(10);
 
-  function updateConfig(key, value) {
-    setConfig((c) => ({ ...c, [key]: value }));
+  useEffect(() => {
+    getStrategies()
+      .then((list) => {
+        setStrategies(list);
+        if (list.length && !list.some((s) => s.id === strategyId)) {
+          setStrategyId(list[0].id);
+        }
+      })
+      .catch((e) => setError(e.message));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const selectedStrategy = strategies.find((s) => s.id === strategyId);
+
+  useEffect(() => {
+    if (selectedStrategy) {
+      setStrategyConfig(defaultsFromSchema(selectedStrategy.config_schema));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedStrategy?.id]);
+
+  function updateStrategyConfig(key, value) {
+    setStrategyConfig((c) => ({ ...c, [key]: value }));
+  }
+
+  function updateExecution(key, value) {
+    setExecution((c) => ({ ...c, [key]: value }));
   }
 
   async function handleRun() {
@@ -63,7 +101,9 @@ export default function App() {
         interval,
         start: new Date(start).toISOString(),
         end: new Date(end).toISOString(),
-        config,
+        strategy: strategyId,
+        strategy_config: strategyConfig,
+        execution,
       };
       const res = await runBacktest(payload);
       setResult(res);
@@ -81,12 +121,10 @@ export default function App() {
 
   // ماشین حساب سود: ریسک هر معامله (به دلار) ضرب در R حاصل‌شده از هر معامله.
   // این یعنی همون مبلغی که در صورت SL خوردن یک معامله از دست می‌دادید.
-  const closedTrades = trades.filter((t) => t.result !== "open");
-  const openTrades = trades.filter((t) => t.result === "open");
-  const closedR = closedTrades.reduce((sum, t) => sum + (t.r_multiple || 0), 0);
-  const openR = openTrades.reduce((sum, t) => sum + (t.r_multiple || 0), 0);
-  const closedProfit = closedR * riskPerTrade;
-  const openProfit = openR * riskPerTrade;
+  // هر معامله وقتی داده‌ی بازه تموم بشه یا به max_holding_bars برسه، بر اساس
+  // قیمت همون لحظه win/loss/breakeven حساب می‌شه (چیزی به اسم "باز" نمی‌مونه).
+  const totalR = trades.reduce((sum, t) => sum + (t.r_multiple || 0), 0);
+  const totalProfit = totalR * riskPerTrade;
 
   return (
     <div className="app">
@@ -114,17 +152,20 @@ export default function App() {
           <input type="datetime-local" value={end} onChange={(e) => setEnd(e.target.value)} />
         </div>
         <div className="field">
-          <label>Entry Mode</label>
-          <select value={config.entry_mode} onChange={(e) => updateConfig("entry_mode", e.target.value)}>
-            <option value="retest">Retest</option>
-            <option value="breakout">Breakout</option>
+          <label>استراتژی</label>
+          <select value={strategyId} onChange={(e) => setStrategyId(e.target.value)}>
+            {strategies.map((s) => (
+              <option key={s.id} value={s.id} title={s.description}>
+                {s.name}
+              </option>
+            ))}
           </select>
         </div>
         <div className="field">
           <label>TP Mode</label>
-          <select value={config.tp_mode} onChange={(e) => updateConfig("tp_mode", e.target.value)}>
-            <option value="split">Split (1R + {config.rr_target}R)</option>
-            <option value="single">Single ({config.rr_target}R)</option>
+          <select value={execution.tp_mode} onChange={(e) => updateExecution("tp_mode", e.target.value)}>
+            <option value="split">Split (1R + {execution.rr_target}R)</option>
+            <option value="single">Single ({execution.rr_target}R)</option>
           </select>
         </div>
         <div className="field">
@@ -132,17 +173,9 @@ export default function App() {
           <input
             type="number"
             step="0.1"
-            value={config.rr_target}
-            onChange={(e) => updateConfig("rr_target", parseFloat(e.target.value))}
+            value={execution.rr_target}
+            onChange={(e) => updateExecution("rr_target", parseFloat(e.target.value))}
             style={{ width: 60 }}
-          />
-        </div>
-        <div className="field">
-          <label>Context Filter</label>
-          <input
-            type="checkbox"
-            checked={config.use_context_filter}
-            onChange={(e) => updateConfig("use_context_filter", e.target.checked)}
           />
         </div>
         <div className="field">
@@ -156,7 +189,7 @@ export default function App() {
             style={{ width: 70 }}
           />
         </div>
-        <button onClick={handleRun} disabled={loading}>
+        <button onClick={handleRun} disabled={loading || !selectedStrategy}>
           {loading ? "در حال اجرا..." : "اجرای بک‌تست"}
         </button>
       </div>
@@ -175,83 +208,93 @@ export default function App() {
               <StatCard label="Avg R" value={stats.avg_r.toFixed(2)} />
               <StatCard label="Profit Factor" value={stats.profit_factor?.toFixed(2) ?? "—"} />
               <StatCard label="Max Drawdown (R)" value={stats.max_drawdown_r.toFixed(2)} />
-              <StatCard label="باز" value={stats.open_trades} />
               <StatCard
-                label={`سود/زیان بسته‌شده ($${riskPerTrade}/معامله)`}
-                value={`${closedProfit >= 0 ? "+" : ""}$${closedProfit.toFixed(2)}`}
-                positive={closedProfit >= 0}
+                label={`سود/زیان کل ($${riskPerTrade}/معامله)`}
+                value={`${totalProfit >= 0 ? "+" : ""}$${totalProfit.toFixed(2)}`}
+                positive={totalProfit >= 0}
               />
-              {stats.open_trades > 0 && (
-                <StatCard
-                  label="سود/زیان شناور (معاملات باز)"
-                  value={`${openProfit >= 0 ? "+" : ""}$${openProfit.toFixed(2)}`}
-                  positive={openProfit >= 0}
-                />
-              )}
             </div>
           )}
 
           <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>تاریخ/ساعت ورود</th>
-                <th>تاریخ/ساعت خروج</th>
-                <th>جهت</th>
-                <th>ورود</th>
-                <th>خروج</th>
-                <th>R</th>
-                <th>$</th>
-                <th>نتیجه</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trades.map((t) => {
-                const dollar = (t.r_multiple || 0) * riskPerTrade;
-                const isSelected = selectedTrade?.id === t.id;
-                return (
-                  <tr
-                    key={t.id}
-                    onClick={() => setSelectedTrade(isSelected ? null : t)}
-                    style={{ cursor: "pointer", background: isSelected ? "#1f2433" : "transparent" }}
-                  >
-                    <td style={{ whiteSpace: "nowrap" }}>{formatDateTime(t.entry_time)}</td>
-                    <td style={{ whiteSpace: "nowrap" }}>{formatDateTime(t.exit_time)}</td>
-                    <td>{t.direction === "bullish" ? "خرید" : "فروش"}</td>
-                    <td>{t.entry_price.toFixed(2)}</td>
-                    <td>{t.exit_price?.toFixed(2) ?? "—"}</td>
-                    <td>{t.r_multiple?.toFixed(2) ?? "—"}</td>
-                    <td className={dollar >= 0 ? "win" : "loss"}>
-                      {dollar >= 0 ? "+" : ""}
-                      {dollar.toFixed(2)}
-                    </td>
-                    <td className={t.result}>{t.result}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+            <table>
+              <thead>
+                <tr>
+                  <th>تاریخ/ساعت ورود</th>
+                  <th>تاریخ/ساعت خروج</th>
+                  <th>جهت</th>
+                  <th>ورود</th>
+                  <th>خروج</th>
+                  <th>R</th>
+                  <th>$</th>
+                  <th>نتیجه</th>
+                </tr>
+              </thead>
+              <tbody>
+                {trades.map((t) => {
+                  const dollar = (t.r_multiple || 0) * riskPerTrade;
+                  const isSelected = selectedTrade?.id === t.id;
+                  return (
+                    <tr
+                      key={t.id}
+                      onClick={() => setSelectedTrade(isSelected ? null : t)}
+                      style={{ cursor: "pointer", background: isSelected ? "#1f2433" : "transparent" }}
+                    >
+                      <td style={{ whiteSpace: "nowrap" }}>{formatDateTime(t.entry_time)}</td>
+                      <td style={{ whiteSpace: "nowrap" }}>{formatDateTime(t.exit_time)}</td>
+                      <td>{t.direction === "bullish" ? "خرید" : "فروش"}</td>
+                      <td>{t.entry_price.toFixed(2)}</td>
+                      <td>{t.exit_price?.toFixed(2) ?? "—"}</td>
+                      <td>{t.r_multiple?.toFixed(2) ?? "—"}</td>
+                      <td className={dollar >= 0 ? "win" : "loss"}>
+                        {dollar >= 0 ? "+" : ""}
+                        {dollar.toFixed(2)}
+                      </td>
+                      <td className={t.result}>{t.result}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
 
-          <details>
-            <summary>تنظیمات پیشرفته استراتژی</summary>
+          <details open>
+            <summary>تنظیمات استراتژی{selectedStrategy ? `: ${selectedStrategy.name}` : ""}</summary>
+            {selectedStrategy?.description && <p className="strategy-desc">{selectedStrategy.description}</p>}
             <div className="config-grid">
-              <NumberField label="Spike lookback" value={config.spike_lookback} onChange={(v) => updateConfig("spike_lookback", v)} />
-              <NumberField label="ATR length" value={config.spike_atr_len} onChange={(v) => updateConfig("spike_atr_len", v)} />
-              <NumberField label="ATR mult" value={config.spike_atr_mult} step={0.1} onChange={(v) => updateConfig("spike_atr_mult", v)} />
-              <NumberField label="Min body ratio" value={config.min_body_ratio} step={0.05} onChange={(v) => updateConfig("min_body_ratio", v)} />
-              <NumberField label="Context EMA len" value={config.context_ema_len} onChange={(v) => updateConfig("context_ema_len", v)} />
-              <NumberField label="Swing width" value={config.swing_fractal_width} onChange={(v) => updateConfig("swing_fractal_width", v)} />
-              <NumberField label="Min 2L swings" value={config.min_2l_swings} onChange={(v) => updateConfig("min_2l_swings", v)} />
-              <NumberField label="Max holding bars" value={config.max_holding_bars} onChange={(v) => updateConfig("max_holding_bars", v)} />
+              {Object.entries(selectedStrategy?.config_schema?.properties || {}).map(([key, rawSchema]) => (
+                <SchemaField
+                  key={key}
+                  name={key}
+                  rawSchema={rawSchema}
+                  value={strategyConfig[key]}
+                  onChange={(v) => updateStrategyConfig(key, v)}
+                />
+              ))}
+            </div>
+          </details>
+
+          <details>
+            <summary>اجرا و مدیریت ریسک (مشترک بین همه‌ی استراتژی‌ها)</summary>
+            <div className="config-grid">
+              <NumberField
+                label="Max holding bars"
+                value={execution.max_holding_bars}
+                onChange={(v) => updateExecution("max_holding_bars", v)}
+              />
+              <NumberField
+                label="Max risk (price units, خالی=بدون سقف)"
+                value={execution.max_risk_price ?? ""}
+                onChange={(v) => updateExecution("max_risk_price", v)}
+              />
               <div className="field">
                 <label title="اگه خاموش باشه، تا معامله‌ی قبلی بسته نشه سیگنال بعدی گرفته نمی‌شه (رفتار واقعی معامله‌گری). اگه روشن باشه، همه‌ی ستاپ‌های شناسایی‌شده مستقل از هم‌پوشانی زمانی حساب می‌شن.">
                   اجازه‌ی معاملات هم‌زمان/هم‌پوشان
                 </label>
                 <input
                   type="checkbox"
-                  checked={config.allow_concurrent_trades}
-                  onChange={(e) => updateConfig("allow_concurrent_trades", e.target.checked)}
+                  checked={execution.allow_concurrent_trades}
+                  onChange={(e) => updateExecution("allow_concurrent_trades", e.target.checked)}
                 />
               </div>
             </div>
@@ -276,7 +319,66 @@ function NumberField({ label, value, onChange, step = 1 }) {
   return (
     <div className="field">
       <label>{label}</label>
-      <input type="number" step={step} value={value} onChange={(e) => onChange(parseFloat(e.target.value))} />
+      <input
+        type="number"
+        step={step}
+        value={value}
+        onChange={(e) => onChange(e.target.value === "" ? null : parseFloat(e.target.value))}
+      />
+    </div>
+  );
+}
+
+// Auto-renders one input for a strategy config field straight from its JSON
+// schema, so adding a new strategy on the backend needs no frontend change.
+function SchemaField({ name, rawSchema, value, onChange }) {
+  const schema = resolveSchema(rawSchema);
+  const label = schema.title || name;
+
+  if (schema.type === "boolean") {
+    return (
+      <div className="field">
+        <label title={schema.description}>{label}</label>
+        <input type="checkbox" checked={!!value} onChange={(e) => onChange(e.target.checked)} />
+      </div>
+    );
+  }
+
+  if (schema.enum) {
+    return (
+      <div className="field">
+        <label title={schema.description}>{label}</label>
+        <select value={value ?? ""} onChange={(e) => onChange(e.target.value)}>
+          {schema.enum.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
+      </div>
+    );
+  }
+
+  if (schema.type === "integer" || schema.type === "number") {
+    return (
+      <div className="field">
+        <label title={schema.description}>{label}</label>
+        <input
+          type="number"
+          step={schema.type === "integer" ? 1 : 0.01}
+          min={schema.minimum}
+          max={schema.maximum}
+          value={value ?? ""}
+          onChange={(e) => onChange(e.target.value === "" ? null : parseFloat(e.target.value))}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="field">
+      <label title={schema.description}>{label}</label>
+      <input value={value ?? ""} onChange={(e) => onChange(e.target.value)} />
     </div>
   );
 }

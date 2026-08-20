@@ -3,9 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.backtest import router as backtest_router
 from app.api.data import router as data_router
-from app.db import Base, engine
 
-Base.metadata.create_all(bind=engine)
+# Schema is managed by Alembic (`alembic upgrade head`), run explicitly
+# before starting the server -- not auto-applied on import, so a schema
+# change is always a deliberate, reviewable migration rather than a silent
+# side effect of starting uvicorn. See README.md for the setup flow.
 
 app = FastAPI(title="SP2L Backtester")
 
